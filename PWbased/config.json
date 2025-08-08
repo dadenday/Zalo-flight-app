@@ -1,0 +1,67 @@
+{
+    "settings": {
+        "manager_loop_delay": 3,
+        "worker_loop_delay": 3,
+        "max_concurrent_flights": 10,
+        "cargo_cache_expiry_hours": 6,
+        "flight_landed_expiration_minutes": 3,
+        "page_refresh_minutes": 25,
+        "zalo_action_delay": 1.0,
+        "manager_zalo_action_delay": 1.5
+    },
+    "zalo_selectors": {
+        "logged_in_sentinel": "div#conversationListId",
+        "group_item": "div.conv-item",
+        "group_title_in_item": "div.conv-item-title__name > div.truncate",
+        "header_title_active_group": "div.header-title",
+        "message_element": "div.chat-item",
+        "message_content": "span.text",
+        "message_time": "span.card-send-time__sendTime",
+        "chat_input": "div#richInput"
+    },
+    "vietjet_cargo": {
+        "enabled": true,
+        "login_url": "https://fs.vietjetair.com/",
+        "credentials": {
+            "username": "Dathhq",
+            "password": "Antonio1!!!"
+        },
+        "selectors": {
+            "username_field": "input#UserName",
+            "password_field": "input#Password",
+            "login_button": "button[type='submit']",
+            "post_login_check": "#clockPanel",
+            "search_input": "input[type='search']",
+            "flight_table_header": "table#flightTable > thead > tr",
+            "first_flight_row": "table#flightTable > tbody > tr:first-child",
+            "message_of_flight_textarea": "textarea#MessagePreview",
+            "uploaded_files_tab": "a[href='#control-sidebar-file-tab']",
+            "loadsheet_link": "a#linkLoadSheet",
+            "cargo_manifest_link": "a#linkCargoManifest"
+        }
+    },
+    "sites": [{
+        "name": "FlightRadar24",
+        "base_url": "https://www.flightradar24.com",
+        "enabled": true,
+        "selectors": {
+            "cookie_accept": "button#onetrust-accept-btn-handler",
+            "time_remaining": "span[data-testid='aircraft-panel__flight-time-remaining']"
+        },
+        "flight_list_selectors": {
+            "search_box": "input#search-input",
+            "airline_result_link_xpath": "//div[text()='Airlines']/following-sibling::div/a[contains(., '{airline_code}')]",
+            "live_flights_link_xpath": "//a[contains(., 'Live {airline_code} flights')]",
+            "data_table_body": "table#table-flighs-list > tbody",
+            "data_table_rows": "table#table-flighs-list > tbody > tr",
+            "flight_number_in_row": "td:nth-child(2) a",
+            "aircraft_in_row": "td:nth-child(3)",
+            "route_in_row": "td:nth-child(4)",
+            "registration_in_row": "td:nth-child(5) a"
+        },
+        "patterns": {
+            "arriving_in": "in\\s+((?:\\d{2}:\\d{2})|(?:\\d{1,2}h\\s)?\\d{1,2}m)",
+            "landed_ago": "(\\d{2}:\\d{2})\\s+ago"
+        }
+    }]
+}

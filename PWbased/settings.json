@@ -1,0 +1,8 @@
+{
+    "control_group": "baocao01",
+    "monitoring_groups": [
+        "baocao02",
+        "baocao03"
+    ],
+    "stay_group": "MainUser"
+}
