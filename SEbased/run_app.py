@@ -2,7 +2,6 @@
 
 import argparse
 import logging
-import os
 import re
 import sys
 import threading
@@ -12,30 +11,25 @@ from queue import Queue, Empty
 from datetime import datetime, timedelta, timezone
 from group_db import load_db, save_db
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from webdriver_manager.chrome import ChromeDriverManager
-
-from config_loader import load_main_config, load_user_settings, save_user_settings, load_timestamps, save_timestamps
+from config_loader import (
+    load_main_config,
+    load_user_settings,
+    save_user_settings,
+    load_timestamps,
+    save_timestamps,
+)
+from drivers import setup_drivers
 from zalo import ZaloManager
+from worker_manager import process_report_queue
+from scheduler import proactive_monitoring_loop
 from workers import FlightWorker, CargoWorker, FlightListWorker, OCRWorker
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s', 
-                   handlers=[logging.FileHandler('flight_monitor.log', mode='w'), logging.StreamHandler()])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(threadName)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("flight_monitor.log", mode="w"), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
-
-def get_chrome_options(profile_dir: str, is_gui: bool = False):
-    options = ChromeOptions()
-    options.add_argument(f"user-data-dir={os.path.abspath(profile_dir)}")
-    if not is_gui:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,800")
-    options.add_experimental_option("prefs", {"profile.default_content_setting_values.notifications": 2})
-    return options
 
 # --- Main Application Controller ---
 
@@ -59,7 +53,7 @@ class AppController:
         self.command_queue = Queue()
         
         # --- NEW: Load Google API Key and configure image processing ---
-        self.google_api_key = main_config.get("google_api_key")
+        self.google_api_key = main_config.google_api_key
         if not self.google_api_key or self.google_api_key == "YOUR_API_KEY_HERE":
             logger.warning("Google API Key not found in config.json. Image processing will be disabled.")
             self.image_processing_enabled = False
@@ -84,19 +78,6 @@ class AppController:
         self.last_check_times = {}
         self.last_refresh_time = time.time()
         self.is_running = True
-
-    def _setup_drivers(self):
-        logger.info("Setting up browser drivers...")
-        try:
-            zalo_options = get_chrome_options('zalo_profile', self.is_gui)
-            self.zalo_driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=zalo_options)
-            worker_options = get_chrome_options('worker_profile', self.is_gui)
-            self.worker_driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=worker_options)
-            logger.info("Drivers are ready.")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set up drivers: {e}", exc_info=True)
-            return False
     
     def _handle_proactive_flight_list(self, flight_list: list):
         """NEW: Processes the flight list from the proactive worker."""
@@ -124,68 +105,23 @@ class AppController:
                     continue
 
                 # Use a placeholder reporting group; this worker's output is for the cache only.
-                worker = CargoWorker(flight_id, 'summary', "CACHE", self.config['vietjet_cargo'], self.worker_driver, self.report_queue)
+                worker = CargoWorker(
+                    flight_id,
+                    'summary',
+                    "CACHE",
+                    self.config.vietjet_cargo,
+                    self.worker_driver,
+                    self.report_queue,
+                )
                 with self.worker_lock:
                     self.active_workers[task_id] = worker
                 worker.start()
                 self.proactive_scrape_tracker[flight_id] = datetime.now() # Mark as scraped
 
-    def _process_report_queue(self):
-        while self.is_running:
-            try:
-                report = self.report_queue.get(timeout=1)
-                task_id, status, is_final = report['task_id'], report['status'], report.get('is_final', False)
-                
-                # --- NEW: Intercept the report from the proactive flight lister ---
-                if task_id == "proactive-flight-list":
-                    self._handle_proactive_flight_list(status) # Status is the list of flights
-                    continue # Do not send this report to Zalo
-
-                # --- Existing Logic ---
-                if report['reporting_group'] == "CACHE": # Silently cache cargo reports
-                    if is_final and task_id.startswith("cargo-"):
-                        logger.info(f"Proactive: Caching final report for task '{task_id}'.")
-                        self.cargo_cache[task_id] = (status, datetime.now())
-                elif task_id in self.flight_subscriptions:
-                    subscribers = self.flight_subscriptions.get(task_id, set())
-                    for group in subscribers: self.zalo_manager.send_message(group, status)
-                else:
-                    self.zalo_manager.send_message(report['reporting_group'], status)
-
-                if is_final:
-                    with self.worker_lock:
-                        if task_id in self.flight_subscriptions: del self.flight_subscriptions[task_id]
-                        if task_id in self.active_workers:
-                            del self.active_workers[task_id]
-            except Empty: continue
-            except Exception as e: logger.error(f"Error processing report queue: {e}")
-
-    def _proactive_monitoring_loop(self):
-        """NEW: The main loop for the scheduled proactive tasks."""
-        # Wait a bit on startup to let the main app settle
-        time.sleep(30) 
-        while self.is_running:
-            try:
-                logger.info("ProactiveScheduler: Triggering 'ai list VJC SGN' workflow.")
-                # The task_id tells _process_report_queue how to handle the result
-                task_id = "proactive-flight-list"
-                # The reporting_group is a placeholder as this won't be sent to Zalo
-                worker = FlightListWorker("VJC", "SGN", "PROACTIVE", self.config['sites'][0], self.worker_driver, self.report_queue)
-                worker.task_id = task_id # Override task_id for special handling
-                
-                # We don't need a lock here as task_id is unique and not user-facing
-                self.active_workers[task_id] = worker
-                worker.start()
-
-                # Run this check every 15 minutes
-                time.sleep(15 * 60)
-            except Exception as e:
-                logger.error(f"Error in proactive monitoring loop: {e}")
-                time.sleep(60) # Wait longer on error
 
     def _handle_command(self, message: str, group_title: str):
         content = message.lower().strip()
-        control_group = self.user_settings['control_group']
+        control_group = self.user_settings.control_group
 
         # --- NEW: Control command for the feature ---
         if content.startswith("ai image") and group_title == control_group:
@@ -226,7 +162,7 @@ class AppController:
                 with self.worker_lock:
                     cache_hit = self.cargo_cache.get(task_id_summary)
 
-                cache_expiry_hours = self.config.get('cargo_cache_expiry_hours', 6)
+                cache_expiry_hours = getattr(self.config, 'cargo_cache_expiry_hours', 6)
                 if cache_hit and (datetime.now() - cache_hit[1] < timedelta(hours=cache_expiry_hours)):
                     report_data, timestamp = cache_hit
                     full_report = f"[BÁO CÁO TỪ BỘ NHỚ ĐỆM (lúc {timestamp.strftime('%H:%M:%S')})]\n" + ("\n".join(report_data) if isinstance(report_data, list) else report_data)
@@ -245,7 +181,7 @@ class AppController:
                                      "status": f"Đã thêm nhóm này vào danh sách theo dõi cho {flight_id}."})
                 return
             
-            site_config = self.config['sites'][0] if self.config['sites'] else None
+            site_config = self.config.sites[0] if self.config.sites else None
             if not site_config:
                 self.report_queue.put({"reporting_group": group_title, "task_id": f"error-{flight_id}", 
                                      "status": "Lỗi: Không có trang web nào được cấu hình."})
@@ -263,7 +199,7 @@ class AppController:
             flight_id, task_type = cargo_match.group(1).strip(), 'info' if cargo_match.group(2) and 'info' in cargo_match.group(2) else 'summary'
             task_id = f"cargo-{flight_id}-{task_type}"
             
-            cache_expiry_hours = self.config.get('cargo_cache_expiry_hours', 6)
+            cache_expiry_hours = getattr(self.config, 'cargo_cache_expiry_hours', 6)
             if task_id in self.cargo_cache and (datetime.now() - self.cargo_cache[task_id][1] < timedelta(hours=cache_expiry_hours)):
                 report_data, _ = self.cargo_cache[task_id]
                 full_report = "[BÁO CÁO TỪ BỘ NHỚ ĐỆM]\n" + ("\n".join(report_data) if isinstance(report_data, list) else report_data)
@@ -275,7 +211,14 @@ class AppController:
                 return
             
             self.report_queue.put({"reporting_group": group_title, "task_id": f"confirm-{task_id}", "status": f"Đang lấy thông tin '{task_type}' cho chuyến bay {flight_id.upper()}..."})
-            worker = CargoWorker(flight_id, task_type, group_title, self.config['vietjet_cargo'], self.worker_driver, self.report_queue)
+            worker = CargoWorker(
+                flight_id,
+                task_type,
+                group_title,
+                self.config.vietjet_cargo,
+                self.worker_driver,
+                self.report_queue,
+            )
             with self.worker_lock: self.active_workers[task_id] = worker
             worker.start()
             return
@@ -298,7 +241,7 @@ class AppController:
                         return
                     time.sleep(1)
 
-                cache_expiry_hours = self.config.get('cargo_cache_expiry_hours', 6)
+                cache_expiry_hours = getattr(self.config, 'cargo_cache_expiry_hours', 6)
                 logger.debug(f"CacheCleaner: Running cleanup for items older than {cache_expiry_hours} hours.")
                 
                 stale_keys = []
@@ -440,14 +383,31 @@ class AppController:
                 time.sleep(60) # Wait longer on error
 
     def run(self):
-        if not self._setup_drivers(): self.shutdown()
-        self.zalo_manager = ZaloManager(self.zalo_driver, self.config['settings'].get('zalo_action_delay', 1.5))
+        try:
+            self.zalo_driver, self.worker_driver = setup_drivers(self.is_gui)
+        except Exception as e:
+            logger.error(f"Failed to set up drivers: {e}", exc_info=True)
+            self.shutdown()
+            return
+        self.zalo_manager = ZaloManager(
+            self.zalo_driver, self.config.settings.get('zalo_action_delay', 1.5)
+        )
         if not self.zalo_manager.login_and_wait(): self.shutdown()
         
-        self.last_check_times = load_timestamps([self.user_settings['control_group']])
+        self.last_check_times = load_timestamps([self.user_settings.control_group])
         
-        report_thread = threading.Thread(target=self._process_report_queue, name="ReportProcessor", daemon=True)
-        proactive_thread = threading.Thread(target=self._proactive_monitoring_loop, name="ProactiveScheduler", daemon=True)
+        report_thread = threading.Thread(
+            target=process_report_queue,
+            args=(self,),
+            name="ReportProcessor",
+            daemon=True,
+        )
+        proactive_thread = threading.Thread(
+            target=proactive_monitoring_loop,
+            args=(self,),
+            name="ProactiveScheduler",
+            daemon=True,
+        )
         cache_cleanup_thread = threading.Thread(target=self._cache_cleanup_loop, name="CacheCleaner", daemon=True)
         # --- NEW: Start the group scanner thread ---
         group_scanner_thread = threading.Thread(target=self._group_scanner_loop, name="GroupScanner", daemon=True)
@@ -475,7 +435,7 @@ class AppController:
                     time.sleep(10)
                     self.last_refresh_time = time.time()
                 
-                groups_to_monitor = self.paid_list.union({self.user_settings['control_group']})
+                groups_to_monitor = self.paid_list.union({self.user_settings.control_group})
                 
                 # --- NEW: Process the internal command queue first ---
                 try:
@@ -499,11 +459,14 @@ class AppController:
                                 self.paid_list.add(new_name)
                                 logger.warning(f"Updated paid list: Replaced '{group_name}' with '{new_name}'.")
 
-                    if self.user_settings['control_group'] not in self.avail_list:
-                         new_name = self.find_renamed_group(self.user_settings['control_group'])
-                         if new_name:
-                             self.user_settings['control_group'] = new_name
-                             logger.warning(f"Updated control group name to '{new_name}'.")
+                    if self.user_settings.control_group not in self.avail_list:
+                        new_name = self.find_renamed_group(self.user_settings.control_group)
+                        if new_name:
+                            self.user_settings.control_group = new_name
+                            save_user_settings(self.user_settings)
+                            logger.warning(
+                                f"Updated control group name to '{new_name}'."
+                            )
 
                     # Process commands from unread groups
                     for group in unread_groups:
@@ -526,10 +489,10 @@ class AppController:
                                         # This worker is short-lived, no need to track in active_workers
                                         worker.start()
                     
-                    stay_group = self.user_settings.get('stay_group')
+                    stay_group = self.user_settings.stay_group
                     if stay_group: self.zalo_manager.navigate_to_group(stay_group)
 
-                time.sleep(self.config['settings'].get('manager_loop_delay', 5))
+                time.sleep(self.config.settings.get('manager_loop_delay', 5))
 
             except KeyboardInterrupt: self.is_running = False
             except Exception as e:
@@ -558,14 +521,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     main_config, user_settings = load_main_config(), load_user_settings()
-    if not user_settings.get('control_group'):
+    if not user_settings.control_group:
         print("\n--- [Manager] INITIAL SETUP ---")
-        cg = input(f"Enter EXACT title for Control Group: ")
-        # Monitoring groups are now managed dynamically, so we don't ask for them.
-        sg = input(f"Enter EXACT title for Stay/Fallback Group: ")
-        user_settings['control_group'] = cg
-        user_settings['monitoring_groups'] = [] # Set to empty as it's no longer used
-        user_settings['stay_group'] = sg
+        cg = input("Enter EXACT title for Control Group: ")
+        sg = input("Enter EXACT title for Stay/Fallback Group: ")
+        user_settings.control_group = cg
+        user_settings.monitoring_groups = []  # Set to empty as it's no longer used
+        user_settings.stay_group = sg
         save_user_settings(user_settings)
         print("Settings saved.")
 
