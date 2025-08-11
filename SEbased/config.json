@@ -17,6 +17,12 @@
         "message_content": "span.text",
         "message_time": "span.card-send-time__sendTime",
         "chat_input": "div#richInput",
+        "message_icon": "i.fa.fa-Message_28_Filled.internal-icon",
+        "contact_icon": "i.fa.fa-Contact_28_Line.internal-icon",
+        "community_icon": "i.fa.fa-Community_List_24_Line.menu__icon",
+        "group_list_items": "div.contact-item-v2-wrapper span.name",
+        "group_avatar": "div#ava_chat_box_view",
+        "invitation_link": "div.pi-group-profile-link__link",
         "unread_notif_icons": [
             "i.fa.fa-1_24_Line.z-noti-badge__content.--big",
             "i.fa.fa-2_24_Line.z-noti-badge__content.--big",
