@@ -65,6 +65,16 @@ class ZaloManager:
         """Finds a group by its title in the conversation list and clicks it."""
         logger.debug(f"Attempting to click group: '{group_title}'")
         try:
+            # Ensure the conversation sidebar is visible
+            try:
+                msg_icon = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors["message_icon"]))
+                )
+                msg_icon.click()
+                time.sleep(self.action_delay)
+            except Exception as e:
+                logger.debug(f"Message icon click skipped or failed: {e}")
+
             # Using XPath to find an element by its exact text content
             group_xpath = f"//*[normalize-space(text())='{group_title}']/ancestor::div[contains(@class, 'conv-item')][1]"
             group_element = WebDriverWait(self.driver, 10).until(
@@ -278,100 +288,96 @@ class ZaloManager:
         Navigates to a specific group without reading or sending messages.
         Used to reset the view to the stay/fallback group.
         """
+        try:
+            msg_icon = WebDriverWait(self.driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors["message_icon"]))
+            )
+            msg_icon.click()
+            time.sleep(self.action_delay)
+        except Exception as e:
+            logger.debug(f"Could not ensure message sidebar: {e}")
+
         if self.get_active_group_name() != group_title:
             logger.info(f"Returning to fallback group: '{group_title}'")
             self._click_group(group_title)
             
-# In zalo.py, replace the existing scrape_all_groups function with this one:
-    def scrape_all_groups(self):
-        """
-        Scrapes all group titles from the conversation sidebar, scrolling down to find all of them.
-        """
-        all_groups = set()
-        scroll_attempts = 0
-        max_scrolls = 20 # Safety break to prevent infinite loops
-
+    def _open_group_list(self) -> bool:
+        """Opens the contacts/community list that contains all groups."""
         try:
-            # Find the scrollable container for the conversation list
-            scroll_container_selector = "div#conversationListId"
-            scroll_container = self.driver.find_element(By.CSS_SELECTOR, scroll_container_selector)
-            
-            while scroll_attempts < max_scrolls:
-                previous_group_count = len(all_groups)
-
-                # Scrape all currently visible groups
-                group_elements = self.driver.find_elements(By.CSS_SELECTOR, self.selectors["group_title_in_item"])
-                for elem in group_elements:
-                    try:
-                        name = elem.text.strip()
-                        if name:
-                            all_groups.add(name)
-                    except Exception:
-                        continue # Ignore stale elements
-
-                # Scroll the container to the bottom
-                self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scroll_container)
-                
-                # Wait for any new groups to load
-                time.sleep(1.5)
-
-                # If the number of groups hasn't changed after scrolling and waiting, we're at the bottom
-                if len(all_groups) == previous_group_count:
-                    logger.info(f"Scraping complete. Found {len(all_groups)} unique groups after {scroll_attempts + 1} scrolls.")
-                    break
-                
-                scroll_attempts += 1
-            
-            if scroll_attempts >= max_scrolls:
-                logger.warning(f"Reached max scrolls ({max_scrolls}). Returning {len(all_groups)} found groups.")
-
-            return list(all_groups)
-
-        except Exception as e:
-            logger.error(f"Could not scrape group list with scrolling: {e}")
-            # Return whatever was found, even if the process failed midway
-            return list(all_groups)
-
-    def click_group_members_icon(self) -> bool:
-        """Clicks the icon in the header that opens the group member sidebar."""
-        try:
-            # This selector targets the clickable area showing member count
-            member_icon_selector = "div.subtitle__groupmember__content"
-            wait = WebDriverWait(self.driver, 10)
-            member_icon = wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, member_icon_selector))
+            msg_icon = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors["message_icon"]))
             )
-            member_icon.click()
-            # Wait for the sidebar to become visible
-            wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "div.chat-box-member")))
-            logger.info("Successfully opened group member sidebar.")
+            msg_icon.click()
+            time.sleep(self.action_delay)
+
+            contact_icon = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors["contact_icon"]))
+            )
+            contact_icon.click()
+            time.sleep(self.action_delay)
+
+            community_icon = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors["community_icon"]))
+            )
+            community_icon.click()
+            time.sleep(self.action_delay)
             return True
-        except TimeoutException:
-            logger.warning("Could not find or click the group member icon.")
+        except Exception as e:
+            logger.warning(f"Could not open group list: {e}")
             return False
 
-    def scrape_group_members(self) -> list[str]:
-        """Scrapes all member names from the visible member sidebar. Assumes sidebar is already open."""
-        members = []
+    def scrape_group_list(self) -> list[str]:
+        """Scrapes all group names from the community list."""
+        if not self._open_group_list():
+            return []
+        group_names = []
         try:
             wait = WebDriverWait(self.driver, 15)
-            # This selector targets each member item in the list
-            member_elements_selector = "div[data-id='div_MemList_MemItem']"
-            member_elements = wait.until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, member_elements_selector))
+            group_elements = wait.until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, self.selectors["group_list_items"]))
             )
-            
-            for elem in member_elements:
-                # The member's full name is reliably in the 'title' attribute
-                name = elem.get_attribute('title')
+            for elem in group_elements:
+                name = elem.text.strip()
                 if name:
-                    members.append(name.strip())
-            
-            logger.info(f"Scraped {len(members)} members.")
-            return members
-        except TimeoutException:
-            logger.error("Timed out waiting for member list to appear in sidebar.")
-            return []
+                    group_names.append(name)
+            logger.info(f"Scraped {len(group_names)} groups from community list.")
+        except Exception as e:
+            logger.error(f"Could not scrape group list: {e}")
+        return group_names
+
+    def open_group_via_list(self, group_title: str) -> bool:
+        """From the community list, open a group's chat window."""
+        if not self._open_group_list():
+            return False
+        try:
+            group_xpath = f"//span[@class='name' and normalize-space(text())='{group_title}']"
+            group_elem = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, group_xpath))
+            )
+            group_elem.click()
+            WebDriverWait(self.driver, 5).until(
+                EC.text_to_be_present_in_element((By.CSS_SELECTOR, self.selectors["header_title_active_group"]), group_title)
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to open group '{group_title}' via list: {e}")
+            return False
+
+    def get_invitation_link(self) -> str | None:
+        """Opens the group info and returns the invitation link."""
+        try:
+            avatar = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors["group_avatar"]))
+            )
+            avatar.click()
+            link_elem = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, self.selectors["invitation_link"]))
+            )
+            link = link_elem.text.strip()
+            return link
+        except Exception as e:
+            logger.warning(f"Could not scrape invitation link: {e}")
+            return None
 
     def close_sidebar_if_open(self):
         """Closes the right sidebar by sending the ESCAPE key to the chat input."""

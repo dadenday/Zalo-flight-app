@@ -34,11 +34,13 @@ def process_report_queue(controller) -> None:
             elif task_id in controller.flight_subscriptions:
                 subscribers = controller.flight_subscriptions.get(task_id, set())
                 for group in subscribers:
-                    controller.zalo_manager.send_message(group, status)
+                    with controller.zalo_lock:
+                        controller.zalo_manager.send_message(group, status)
             else:
-                controller.zalo_manager.send_message(
-                    report["reporting_group"], status
-                )
+                with controller.zalo_lock:
+                    controller.zalo_manager.send_message(
+                        report["reporting_group"], status
+                    )
 
             if is_final:
                 with controller.worker_lock:

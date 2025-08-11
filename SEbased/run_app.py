@@ -6,7 +6,6 @@ import re
 import sys
 import threading
 import time
-import uuid
 from queue import Queue, Empty
 from datetime import datetime, timedelta, timezone
 from group_db import load_db, save_db
@@ -47,7 +46,7 @@ class AppController:
         # --- NEW: Concurrency lock and database state ---
         self.zalo_lock = threading.Lock()
         self.group_db = load_db()
-        self.group_scan_queue = [] # A simple queue for which group to scan next
+        self.group_scan_queue = Queue()
         
         # --- NEW: State for image processing ---
         self.command_queue = Queue()
@@ -64,7 +63,6 @@ class AppController:
         self.cargo_cache = {}
         self.avail_list = set()
         self.paid_list = set()
-        self.last_group_scrape_time = 0
         
         # --- NEW: State for proactive workflow ---
         self.proactive_flight_list = [] # Stores list of dicts from FlightListWorker
@@ -270,117 +268,67 @@ class AppController:
                 logger.error(f"Error in cache cleanup loop: {e}")
                 time.sleep(60)
 
-    # --- NEW: Group identity and validation logic ---
-    def _calculate_similarity(self, set1, set2):
-        """Calculates the Jaccard similarity between two sets."""
-        if not set1 and not set2:
-            return 1.0
-        if not set1 or not set2:
-            return 0.0
-        intersection = len(set1.intersection(set2))
-        union = len(set1.union(set2))
-        return intersection / union
+    # --- Background threads for group management ---
 
-    def find_renamed_group(self, old_name: str) -> str | None:
-        """Tries to find a renamed group by comparing member lists."""
-        logger.warning(f"Attempting to find potentially renamed group for '{old_name}'...")
-        
-        # Find the old group's data in our DB
-        old_group_id = None
-        for gid, data in self.group_db.items():
-            if data['current_name'] == old_name:
-                old_group_id = gid
-                break
-        
-        if not old_group_id:
-            logger.error(f"No database entry found for '{old_name}'. Cannot validate rename.")
-            return None
-            
-        last_known_members = set(self.group_db[old_group_id]['last_known_members'])
-        if not last_known_members:
-            logger.error(f"No members recorded for '{old_name}'. Cannot validate rename.")
-            return None
-
-        # Compare against all current groups in the DB
-        best_match_name = None
-        highest_similarity = 0.75 # Must be at least 75% similar
-
-        for gid, data in self.group_db.items():
-            # Skip comparing a group to itself
-            if gid == old_group_id:
-                continue
-
-            current_members = set(data['last_known_members'])
-            similarity = self._calculate_similarity(last_known_members, current_members)
-            
-            if similarity > highest_similarity:
-                highest_similarity = similarity
-                best_match_name = data['current_name']
-        
-        if best_match_name:
-            logger.info(f"Found a likely match for '{old_name}'! New name: '{best_match_name}' with {highest_similarity:.2f} similarity.")
-            # Update the DB to merge the old record into the new one
-            self.group_db[old_group_id]['current_name'] = best_match_name
-            save_db(self.group_db)
-            return best_match_name
-            
-        logger.warning(f"Could not find a suitable rename match for '{old_name}'.")
-        return None
-
-    # --- NEW: Background thread for scanning group members ---
-    def _group_scanner_loop(self):
-        """Periodically scrapes members from groups to keep the database updated."""
-        time.sleep(10) # Initial delay
-        logger.info("Group Member Scanner thread started.")
-        
+    def _group_list_loop(self):
+        """Periodically scrapes the community list for group names."""
+        time.sleep(5)
+        logger.info("Group List worker started.")
         while self.is_running:
             try:
-                # If the scan queue is empty, populate it with all known groups
-                if not self.group_scan_queue:
-                    # Sort for consistent, alphabetical order
-                    self.group_scan_queue = sorted(list(self.avail_list))
-
-                if not self.group_scan_queue:
-                    # Still no groups, wait a bit
-                    time.sleep(60)
-                    continue
-
-                # Get the next group to scan
-                group_to_scan = self.group_scan_queue.pop(0)
-
-                logger.info(f"[Scanner] Acquiring lock to scan group: '{group_to_scan}'")
                 with self.zalo_lock:
-                    self.zalo_manager.close_sidebar_if_open() # Cleanup first
-                    if self.zalo_manager._click_group(group_to_scan):
-                        if self.zalo_manager.click_group_members_icon():
-                            members = self.zalo_manager.scrape_group_members()
-                            if members:
-                                # Find if this group exists in DB or create a new entry
-                                group_id = None
-                                for gid, data in self.group_db.items():
-                                    if data['current_name'] == group_to_scan:
-                                        group_id = gid
-                                        break
-                                
-                                if not group_id: # New group, create ID
-                                    group_id = str(uuid.uuid4())
-                                
-                                # Update DB record
-                                self.group_db[group_id] = {
-                                    "current_name": group_to_scan,
-                                    "last_known_members": members,
-                                    "last_updated": datetime.now(timezone.utc).isoformat()
-                                }
-                                save_db(self.group_db)
-                        self.zalo_manager.close_sidebar_if_open()
-                logger.info(f"[Scanner] Released lock after scanning.")
-
-                # Wait for the configured interval before next scan
-                time.sleep(180) # 3 minutes between scans
-
+                    scraped = self.zalo_manager.scrape_group_list()
+                if scraped:
+                    new_set = set(scraped)
+                    added = new_set - self.avail_list
+                    if added:
+                        logger.info(f"Detected {len(added)} new/renamed groups: {list(added)}")
+                        for name in added:
+                            self.group_scan_queue.put(name)
+                    self.avail_list = new_set
+                time.sleep(15 * 60)
             except Exception as e:
-                logger.error(f"Error in group scanner loop: {e}", exc_info=True)
-                time.sleep(60) # Wait longer on error
+                logger.error(f"Error in group list loop: {e}", exc_info=True)
+                time.sleep(60)
+
+    def _group_validation_loop(self):
+        """Consumes groups from queue and records their invitation link."""
+        time.sleep(10)
+        logger.info("Group Validation thread started.")
+        while self.is_running:
+            try:
+                group_to_scan = self.group_scan_queue.get(timeout=5)
+            except Empty:
+                time.sleep(1)
+                continue
+            try:
+                logger.info(f"[Validator] Acquiring lock for '{group_to_scan}'")
+                with self.zalo_lock:
+                    self.zalo_manager.close_sidebar_if_open()
+                    if self.zalo_manager.open_group_via_list(group_to_scan):
+                        link = self.zalo_manager.get_invitation_link()
+                        if link:
+                            group_id = link.rstrip('/').split('/')[-1]
+                            record = self.group_db.get(group_id)
+                            old_name = record['current_name'] if record else None
+                            self.group_db[group_id] = {
+                                "current_name": group_to_scan,
+                                "invite_link": link,
+                                "last_updated": datetime.now(timezone.utc).isoformat(),
+                            }
+                            save_db(self.group_db)
+                            if old_name and old_name != group_to_scan:
+                                if old_name in self.paid_list:
+                                    self.paid_list.remove(old_name)
+                                    self.paid_list.add(group_to_scan)
+                                if old_name == self.user_settings.control_group:
+                                    self.user_settings.control_group = group_to_scan
+                                    save_user_settings(self.user_settings)
+                        self.zalo_manager.close_sidebar_if_open()
+                logger.info(f"[Validator] Finished processing '{group_to_scan}'")
+            except Exception as e:
+                logger.error(f"Error in group validation loop: {e}", exc_info=True)
+                time.sleep(30)
 
     def run(self):
         try:
@@ -390,7 +338,9 @@ class AppController:
             self.shutdown()
             return
         self.zalo_manager = ZaloManager(
-            self.zalo_driver, self.config.settings.get('zalo_action_delay', 1.5)
+            self.zalo_driver,
+            self.config.zalo_selectors,
+            self.config.settings.get('zalo_action_delay', 1.5),
         )
         if not self.zalo_manager.login_and_wait(): self.shutdown()
         
@@ -409,26 +359,18 @@ class AppController:
             daemon=True,
         )
         cache_cleanup_thread = threading.Thread(target=self._cache_cleanup_loop, name="CacheCleaner", daemon=True)
-        # --- NEW: Start the group scanner thread ---
-        group_scanner_thread = threading.Thread(target=self._group_scanner_loop, name="GroupScanner", daemon=True)
+        group_list_thread = threading.Thread(target=self._group_list_loop, name="GroupListWorker", daemon=True)
+        group_validator_thread = threading.Thread(target=self._group_validation_loop, name="GroupValidator", daemon=True)
         
         report_thread.start()
         proactive_thread.start()
         cache_cleanup_thread.start()
-        group_scanner_thread.start()
+        group_list_thread.start()
+        group_validator_thread.start()
         
         logger.info("Setup complete. Starting main monitoring loop...")
         while self.is_running:
             try:
-                # --- This block now feeds the scanner ---
-                if time.time() - self.last_group_scrape_time > 15 * 60:
-                    logger.info("Scraping Zalo sidebar to update available groups list...")
-                    with self.zalo_lock:
-                         scraped_groups = self.zalo_manager.scrape_all_groups()
-                    if scraped_groups:
-                        self.avail_list = set(scraped_groups)
-                    self.last_group_scrape_time = time.time()
-                
                 if time.time() - self.last_refresh_time > 4 * 3600:
                     logger.info("Performing periodic 4-hour refresh of Zalo page.")
                     self.zalo_manager.driver.refresh()
@@ -445,52 +387,32 @@ class AppController:
                 except Empty:
                     pass # No queued commands, proceed as normal
 
-                # --- MODIFIED: Main loop now uses the Zalo lock and rename validation ---
                 with self.zalo_lock:
+                    stay_group = self.user_settings.stay_group
+                    if stay_group:
+                        self.zalo_manager.navigate_to_group(stay_group)
+
                     unread_groups = self.zalo_manager.get_unread_group_names()
-                    
-                    # Validate that our monitored groups still exist
-                    current_paid_list = self.paid_list.copy()
-                    for group_name in current_paid_list:
-                        if group_name not in self.avail_list:
-                            new_name = self.find_renamed_group(group_name)
-                            if new_name:
-                                self.paid_list.remove(group_name)
-                                self.paid_list.add(new_name)
-                                logger.warning(f"Updated paid list: Replaced '{group_name}' with '{new_name}'.")
 
-                    if self.user_settings.control_group not in self.avail_list:
-                        new_name = self.find_renamed_group(self.user_settings.control_group)
-                        if new_name:
-                            self.user_settings.control_group = new_name
-                            save_user_settings(self.user_settings)
-                            logger.warning(
-                                f"Updated control group name to '{new_name}'."
-                            )
-
-                    # Process commands from unread groups
                     for group in unread_groups:
                         if group in groups_to_monitor:
                             if group not in self.last_check_times:
                                 self.last_check_times[group] = datetime.now() - timedelta(days=1)
-                            
+
                             new_messages = self.zalo_manager.read_new_messages(group, self.last_check_times[group])
                             if new_messages:
                                 self.last_check_times[group] = new_messages[-1]['timestamp']
                                 for msg in new_messages:
-                                    # If it's a text message, handle as a command
                                     if msg['type'] == 'text':
                                         self._handle_command(msg['content'], group)
-                                    # If it's an image and the feature is on, start the OCR worker
                                     elif msg['type'] == 'image' and self.image_processing_enabled:
                                         logger.info(f"Image detected in '{group}'. Starting Gemini-powered OCR worker.")
-                                        worker = OCRWorker(msg['content'], group, self.google_api_key, 
+                                        worker = OCRWorker(msg['content'], group, self.google_api_key,
                                                         self.command_queue, self.report_queue)
-                                        # This worker is short-lived, no need to track in active_workers
                                         worker.start()
-                    
-                    stay_group = self.user_settings.stay_group
-                    if stay_group: self.zalo_manager.navigate_to_group(stay_group)
+
+                    if stay_group:
+                        self.zalo_manager.navigate_to_group(stay_group)
 
                 time.sleep(self.config.settings.get('manager_loop_delay', 5))
 
